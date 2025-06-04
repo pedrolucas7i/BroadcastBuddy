@@ -1,139 +1,177 @@
 import os
-import time
 import tempfile
+import time
 import subprocess
 import json
 import smtplib
+import logging
 from email.mime.text import MIMEText
-from pydub import AudioSegment, silence
-import speech_recognition as sr
+
+import streamlink
+import whisper
 from dotenv import load_dotenv
 
+# === Configuração Inicial ===
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 
-load_dotenv()  # Load environment variables from .env file
-
-
-# -------- CONFIG --------
-
-IPTV_URL = "https://d277k9d1h9dro4.cloudfront.net/out/v1/293e7c3464824cbd8818ab8e49dc5fe9/index.m3u8"  # Your IPTV stream URL here
-
-EMAIL_SENDER = os.getenv("EMAIL_SENDER", "")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "")
-EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER", "")
+# === Constantes ===
+IPTV_URL = os.getenv("IPTV_URL", "https://d277k9d1h9dro4.cloudfront.net/out/v1/293e7c3464824cbd8818ab8e49dc5fe9/index.m3u8")
+EMAIL_SENDER = os.getenv("EMAIL_SENDER")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 465
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:4b")
+SEGMENT_LENGTH_SEC = 5
+OLLAMA_CHUNK_SIZE_CHARS = 500
 
-# Ollama model name (make sure you installed it)
-OLLAMA_MODEL = "llama3.2:1b"
+# === Inicialização do Whisper ===
+try:
+    whisper_model = whisper.load_model("base")
+    logging.info("Modelo Whisper carregado com sucesso.")
+except Exception as e:
+    logging.error(f"Erro ao carregar modelo Whisper: {e}")
+    exit(1)
 
-SEGMENT_LENGTH_SEC = 60  # how many seconds per audio chunk to process
+# === Funções Utilitárias ===
 
-# Silence detection params (adjust if needed)
-MIN_SILENCE_LEN_MS = 1500
-SILENCE_THRESH_DB = -40
-AD_SILENCE_COUNT_THRESHOLD = 3  # number of silence chunks to assume ads started
+def download_stream_segment(url, duration, output_path):
+    try:
+        streams = streamlink.streams(url)
+        stream = streams.get("best")
+        if not stream:
+            logging.warning("Qualidade 'best' não encontrada.")
+            return False
 
-# ------------------------
+        with stream.open() as fd, open(output_path, "wb") as out_file:
+            start = time.time()
+            while time.time() - start < duration:
+                data = fd.read(1024)
+                if not data:
+                    break
+                out_file.write(data)
+        return True
+    except Exception as e:
+        logging.error(f"Erro ao baixar segmento de stream: {e}")
+        return False
 
-
-def download_audio_segment(url, start_sec, duration_sec, output_path):
-    # Grab audio segment from IPTV stream with ffmpeg
-    cmd = (
-        f"ffmpeg -y -ss {start_sec} -i \"{url}\" -t {duration_sec} "
-        f"-vn -acodec pcm_s16le -ar 16000 -ac 1 \"{output_path}\""
-    )
-    os.system(cmd)
-
+def extract_audio(input_path, output_path):
+    try:
+        subprocess.run([
+            "ffmpeg", "-y", "-i", input_path,
+            "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+            output_path
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError("Erro ao extrair áudio com ffmpeg.") from e
 
 def transcribe_audio(file_path):
-    recognizer = sr.Recognizer()
-    with sr.AudioFile(file_path) as source:
-        audio = recognizer.record(source)
     try:
-        return recognizer.recognize_google(audio)
-    except sr.UnknownValueError:
-        return ""
-    except sr.RequestError as e:
-        print(f"Speech recognition API error: {e}")
+        result = whisper_model.transcribe(file_path)
+        return result.get("text", "")
+    except Exception as e:
+        logging.error(f"Erro na transcrição com Whisper: {e}")
         return ""
 
+def update_summary(summary, new_chunk):
+    prompt = f"""Você é um assistente de IA que resume transcrições de vídeo de um canal de IPTV legalmente acessado. 
+    Seu único trabalho é atualizar um resumo contínuo do conteúdo. Você não está promovendo ou apoiando qualquer atividade ilegal, 
+    apenas gerando um resumo informativo mas compacto baseado em transcrição de áudio.
 
-def ollama_summarize(text):
-    prompt = f"Summarize this content briefly:\n{text}"
+    Instruções:
+    1. Se o RESUMO ATUAL estiver vazio, crie um resumo inicial usando apenas o NOVO TRECHO DE TRANSCRIÇÃO.
+    2. Se já houver um RESUMO ATUAL, analise o NOVO TRECHO DE TRANSCRIÇÃO e atualize o resumo anterior com novas informações relevantes.
+    3. Mantenha o resumo conciso e informativo. Não inclua avisos, desculpas ou comentários fora do contexto.
+
+    RESUMO ATUAL:
+    {summary}
+
+    NOVO TRECHO DE TRANSCRIÇÃO:
+    {new_chunk}
+
+    RESUMO ATUALIZADO:"""
+
+
     try:
         result = subprocess.run(
-            ['ollama', 'run', OLLAMA_MODEL, '--json'],
-            input=json.dumps({"prompt": prompt}),
-            text=True,
-            capture_output=True,
-            check=True
+            ['ollama', 'run', OLLAMA_MODEL, prompt],
+            capture_output=True, text=True, check=True
         )
-        response = json.loads(result.stdout)
-        return response.get('completion', '').strip()
-    except Exception as e:
-        print(f"Ollama error: {e}")
-        return "Error generating summary."
-
+        try:
+            parsed = json.loads(result.stdout)
+            return parsed.get('completion', summary).strip()
+        except json.JSONDecodeError:
+            return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Erro ao executar Ollama: {e.stderr}")
+        return summary
 
 def send_email(subject, body):
-    msg = MIMEText(body)
-    msg['From'] = EMAIL_SENDER
-    msg['To'] = EMAIL_RECEIVER
-    msg['Subject'] = subject
-
+    if not all([EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER]):
+        logging.error("Informações de e-mail ausentes.")
+        return
     try:
+        msg = MIMEText(body)
+        msg['From'] = EMAIL_SENDER
+        msg['To'] = EMAIL_RECEIVER
+        msg['Subject'] = subject
+
         with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
             server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
-        print("Email sent successfully!")
+            server.send_message(msg)
+        logging.info("E-mail enviado com sucesso.")
     except Exception as e:
-        print(f"Failed to send email: {e}")
+        logging.error(f"Erro ao enviar e-mail: {e}")
 
-
-def detect_ads(audio_segment):
-    silent_chunks = silence.detect_silence(
-        audio_segment,
-        min_silence_len=MIN_SILENCE_LEN_MS,
-        silence_thresh=SILENCE_THRESH_DB
-    )
-    return len(silent_chunks) >= AD_SILENCE_COUNT_THRESHOLD
-
+# === Função Principal ===
 
 def main():
-    print("Starting IPTV monitoring...")
-    summary_text = ""
-    start_time = 0
-    ads_started = False
+    logging.info("Monitoramento IPTV iniciado. Pressione Ctrl+C para parar.")
+    summary = ""
+    transcript_accum = ""
 
-    while not ads_started:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio_file:
-            temp_path = temp_audio_file.name
+    try:
+        while True:
+            with tempfile.NamedTemporaryFile(suffix=".ts", delete=False) as temp_stream, \
+                 tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
+                stream_path = temp_stream.name
+                audio_path = temp_audio.name
 
-        print(f"Downloading audio segment: {start_time}s to {start_time + SEGMENT_LENGTH_SEC}s")
-        download_audio_segment(IPTV_URL, start_time, SEGMENT_LENGTH_SEC, temp_path)
+            if not download_stream_segment(IPTV_URL, SEGMENT_LENGTH_SEC, stream_path):
+                logging.warning("Falha ao baixar segmento. Repetindo em 5s...")
+                time.sleep(5)
+                continue
 
-        audio = AudioSegment.from_wav(temp_path)
-        ads_started = detect_ads(audio)
+            try:
+                extract_audio(stream_path, audio_path)
+                chunk = transcribe_audio(audio_path)
+            except Exception as e:
+                logging.error(f"Erro no processamento de áudio: {e}")
+                continue
+            finally:
+                os.remove(stream_path)
+                os.remove(audio_path)
 
-        if not ads_started:
-            transcript = transcribe_audio(temp_path)
-            print(f"Transcript: {transcript[:150]}...")
-            summary_text += " " + transcript
-            start_time += SEGMENT_LENGTH_SEC
-        else:
-            print("Ads detected! Ending program monitoring.")
+            if chunk:
+                transcript_accum += " " + chunk
+                if len(transcript_accum) >= OLLAMA_CHUNK_SIZE_CHARS:
+                    summary = update_summary(summary, transcript_accum)
+                    transcript_accum = ""
+                    logging.info(f"\nResumo atualizado:\n{summary}\n{'-'*40}")
+                else:
+                    logging.info(f"Transcrição acumulada: {len(transcript_accum)} caracteres.")
+            time.sleep(1)
 
-        os.remove(temp_path)
-        time.sleep(1)  # avoid tight loop
+    except KeyboardInterrupt:
+        logging.info("Interrompido pelo usuário. Gerando resumo final...")
+        if transcript_accum:
+            summary = update_summary(summary, transcript_accum)
+        logging.info(f"Resumo Final:\n{summary}")
+        send_email("Resumo IPTV", summary)
+    except Exception as e:
+        logging.critical(f"Erro inesperado: {e}")
 
-    print("Generating summary with Ollama...")
-    short_summary = ollama_summarize(summary_text)
-
-    print("Summary:\n", short_summary)
-
-    print("Sending summary email...")
-    send_email("IPTV Program Summary", short_summary)
-
-
+# === Execução ===
 if __name__ == "__main__":
     main()
