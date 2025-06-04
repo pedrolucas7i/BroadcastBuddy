@@ -3,4 +3,5 @@ speechrecognition
 python-dotenv
 openai-whisper
 PyQt5
-opencv-python
+opencv-python-headless
+streamlink
