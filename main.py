@@ -103,16 +103,31 @@ class TranscriptionWorker(QObject):
 
     def update_summary(self, current, new_chunk):
         prompt = f"""
-Você é um assistente de IA que resume transcrições de vídeo de um canal de IPTV legalmente acessado.
+    Você é um assistente de IA especializado em acompanhar transmissões de vídeo (por exemplo, canais de IPTV legalmente acessados) e gerar resumos informativos e úteis com base no conteúdo transcrito.
 
-RESUMO ATUAL:
-{current}
+    Sua tarefa é manter um **resumo contínuo** dos pontos mais importantes, **atualizando-o à medida que novos trechos da transcrição chegam**.
 
-NOVO TRECHO DE TRANSCRIÇÃO:
-{new_chunk}
+    🧠 Diretrizes:
+    - **Analise criticamente** o novo trecho de transcrição.
+    - Mantenha no resumo **somente as informações mais relevantes e úteis**, como:
+    - eventos importantes;
+    - nomes de pessoas, lugares ou organizações;
+    - dados, números ou estatísticas;
+    - instruções claras ou decisões;
+    - frases ou falas que indiquem contexto, opinião forte, mudança de tópico, ou ação concreta.
+    - Ignore conteúdos redundantes, triviais ou irrelevantes (ex: cumprimentos, hesitações, repetições).
+    - Escreva o resumo em estilo **objetivo e claro**, como se fosse para alguém que quer entender rapidamente o conteúdo do vídeo.
 
-RESUMO ATUALIZADO:
-"""
+    📌 Se o resumo anterior já contém algo importante que se repete no novo trecho, **evite repetir** — apenas complemente ou refine.
+
+    RESUMO ATUAL:
+    {current}
+
+    NOVO TRECHO DE TRANSCRIÇÃO:
+    {new_chunk}
+
+    RESUMO ATUALIZADO:
+    """
 
         try:
             result = subprocess.run(
