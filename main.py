@@ -1,4 +1,5 @@
 import os
+import vlc
 import cv2
 import time
 import json
@@ -163,11 +164,10 @@ class IPTVApp(QWidget):
         self.thread = Thread(target=self.worker.run, daemon=True)
         self.thread.start()
 
-        # Timer de vídeo
-        self.cap = self.init_stream_capture()
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_frame)
-        self.timer.start(30)
+        self.init_vlc_player()
+
+
+        
 
     def init_stream_capture(self):
         try:
@@ -199,9 +199,27 @@ class IPTVApp(QWidget):
 
     def closeEvent(self, event):
         self.worker.stop()
-        if self.cap:
-            self.cap.release()
+        if hasattr(self, 'media_player') and self.media_player:
+            self.media_player.stop()
         event.accept()
+
+
+    def init_vlc_player(self):
+        self.vlc_instance = vlc.Instance()
+        self.media_player = self.vlc_instance.media_player_new()
+        media = self.vlc_instance.media_new(IPTV_URL)
+        self.media_player.set_media(media)
+
+        # Conecta ao widget do vídeo
+        if sys.platform.startswith("linux"):  # Linux
+            self.media_player.set_xwindow(int(self.video_label.winId()))
+        elif sys.platform == "win32":  # Windows
+            self.media_player.set_hwnd(int(self.video_label.winId()))
+        elif sys.platform == "darwin":  # macOS
+            self.media_player.set_nsobject(int(self.video_label.winId()))
+
+        self.media_player.play()
+
 
 # === Execução ===
 if __name__ == "__main__":
